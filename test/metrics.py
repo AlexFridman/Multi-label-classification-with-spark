@@ -16,7 +16,7 @@ class Metric:
     
     @property
     def avg(self):
-        return np.average(_results)
+        return np.average(self._results)
     
     def evaluate(self, lables, predictions):
         pass
