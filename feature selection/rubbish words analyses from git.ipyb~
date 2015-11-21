@@ -1,0 +1,969 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "from pyspark import RDD"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "class StoringTF(object):\n",
+    "    def fit(self, vacabulary):\n",
+    "        self.word_idx = vacabulary.distinct().zipWithIndex().collectAsMap()\n",
+    "        self.numFeatures = len(self.word_idx)\n",
+    "        \n",
+    "    def indexOf(self, term):\n",
+    "        \"\"\" Returns the index of the input term. \"\"\"\n",
+    "        return self.word_idx[term]\n",
+    "\n",
+    "    def transform(self, document):\n",
+    "        \"\"\"\n",
+    "        Transforms the input document (list of terms) to term frequency\n",
+    "        vectors, or transform the RDD of document to RDD of term\n",
+    "        frequency vectors.\n",
+    "        \"\"\"\n",
+    "        if isinstance(document, RDD):\n",
+    "            return document.map(self.transform)\n",
+    "\n",
+    "        freq = {}\n",
+    "        for term in document:\n",
+    "            i = self.indexOf(term)\n",
+    "            freq[i] = freq.get(i, 0) + 1.0\n",
+    "        return Vectors.sparse(self.numFeatures, freq.items())"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "import json\n",
+    "#from pyspark.mllib.feature import HashingTF\n",
+    "from pyspark.mllib.feature import IDF\n",
+    "import numpy as np\n",
+    "from pyspark.mllib.linalg import Vectors"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "PythonRDD[2] at RDD at PythonRDD.scala:43"
+      ]
+     },
+     "execution_count": 4,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "data = sc.textFile('hdfs://master:54310/clean'). \\\n",
+    "    map(lambda line: json.loads(line))\n",
+    "\n",
+    "documents = data.map(lambda x: x['Features'])\n",
+    "documents.cache()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "vocabulary = documents.flatMap(lambda d: d).distinct()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "storingTF = StoringTF()\n",
+    "storingTF.fit(vocabulary)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "tf = storingTF.transform(documents)\n",
+    "idf = IDF().fit(tf)\n",
+    "tfidf = idf.transform(tf)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "metadata": {
+    "collapsed": false,
+    "scrolled": true
+   },
+   "outputs": [],
+   "source": [
+    "wc = documents.flatMap(lambda d: set(d)). \\\n",
+    "    map(lambda w: (w,1)). \\\n",
+    "    reduceByKey(lambda a,b: a+b). \\\n",
+    "    map(lambda wc: (storingTF.indexOf(wc[0]), wc[1])). \\\n",
+    "    persist()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "98621"
+      ]
+     },
+     "execution_count": 9,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "documents.flatMap(lambda d: set(d)).map(lambda w: storingTF.indexOf(w)).distinct().count()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "def cast_sparse_vector_to_dict_and_scale(v):\n",
+    "    max_v = v.toArray().max()\n",
+    "    return dict([(int(i), v[int(i)] / max_v) for i in v.indices])\n",
+    "\n",
+    "import operator\n",
+    "def order_dict_by_values(d: dict, asc = True):\n",
+    "    return sorted(d.items(), key = operator.itemgetter(1), reverse= not asc)\n",
+    "\n",
+    "def filter_values_under_percent(vec, percent: int):\n",
+    "    tfidfs = cast_sparse_vector_to_dict_and_scale(vec)\n",
+    "    ordered_tfidfs = order_dict_by_values(tfidfs)\n",
+    "    indexes = list(map(lambda k: k[0], ordered_tfidfs))\n",
+    "    index = int(len(indexes) * percent / 100)\n",
+    "    return indexes[:index]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {
+    "collapsed": false,
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "p: 10, t: 0.9, count: 0\n",
+      "p: 10, t: 0.8, count: 0\n",
+      "p: 10, t: 0.7, count: 1\n",
+      "p: 10, t: 0.6, count: 6\n",
+      "p: 10, t: 0.5, count: 41\n",
+      "p: 10, t: 0.4, count: 89\n",
+      "p: 10, t: 0.3, count: 131\n",
+      "p: 10, t: 0.2, count: 179\n",
+      "p: 10, t: 0.1, count: 255\n",
+      "p: 20, t: 0.9, count: 0\n",
+      "p: 20, t: 0.8, count: 1\n",
+      "p: 20, t: 0.7, count: 15\n",
+      "p: 20, t: 0.6, count: 108\n",
+      "p: 20, t: 0.5, count: 216\n",
+      "p: 20, t: 0.4, count: 300\n",
+      "p: 20, t: 0.3, count: 388\n",
+      "p: 20, t: 0.2, count: 479\n",
+      "p: 20, t: 0.1, count: 629\n",
+      "p: 30, t: 0.9, count: 1\n",
+      "p: 30, t: 0.8, count: 12\n",
+      "p: 30, t: 0.7, count: 123\n",
+      "p: 30, t: 0.6, count: 339\n",
+      "p: 30, t: 0.5, count: 492\n",
+      "p: 30, t: 0.4, count: 613\n",
+      "p: 30, t: 0.3, count: 741\n",
+      "p: 30, t: 0.2, count: 908\n",
+      "p: 30, t: 0.1, count: 1216\n",
+      "p: 40, t: 0.9, count: 3\n",
+      "p: 40, t: 0.8, count: 74\n",
+      "p: 40, t: 0.7, count: 402\n",
+      "p: 40, t: 0.6, count: 659\n",
+      "p: 40, t: 0.5, count: 881\n",
+      "p: 40, t: 0.4, count: 1101\n",
+      "p: 40, t: 0.3, count: 1345\n",
+      "p: 40, t: 0.2, count: 1624\n",
+      "p: 40, t: 0.1, count: 2169\n",
+      "p: 50, t: 0.9, count: 17\n",
+      "p: 50, t: 0.8, count: 313\n",
+      "p: 50, t: 0.7, count: 830\n",
+      "p: 50, t: 0.6, count: 1213\n",
+      "p: 50, t: 0.5, count: 1552\n",
+      "p: 50, t: 0.4, count: 1907\n",
+      "p: 50, t: 0.3, count: 2319\n",
+      "p: 50, t: 0.2, count: 2883\n",
+      "p: 50, t: 0.1, count: 3901\n",
+      "p: 60, t: 0.9, count: 101\n",
+      "p: 60, t: 0.8, count: 837\n",
+      "p: 60, t: 0.7, count: 1494\n",
+      "p: 60, t: 0.6, count: 2083\n",
+      "p: 60, t: 0.5, count: 2704\n",
+      "p: 60, t: 0.4, count: 3445\n",
+      "p: 60, t: 0.3, count: 4292\n",
+      "p: 60, t: 0.2, count: 5431\n",
+      "p: 60, t: 0.1, count: 7737\n"
+     ]
+    }
+   ],
+   "source": [
+    "experiments = {}\n",
+    "for p in [10, 20, 30, 40, 50, 60]:\n",
+    "    excluded = tfidf.flatMap(lambda vec: filter_values_under_percent(vec, p)). \\\n",
+    "        map(lambda i: (i, 1)). \\\n",
+    "        reduceByKey(lambda a,b: a+b).persist()\n",
+    "    stat = wc.join(excluded).map(lambda s: (s[0], s[1][1]/s[1][0])).persist()\n",
+    "    experiment = {}\n",
+    "    for t in [.9, .8, .7, .6, .5, .4, .3, .2, .1]:\n",
+    "        excluded_count = stat.filter(lambda s: s[1] > t).count()\n",
+    "        experiment[t] = excluded_count\n",
+    "        print(\"p: {0}, t: {1}, count: {2}\".format(p, t, excluded_count))\n",
+    "    stat.unpersist()\n",
+    "    excluded.unpersist()\n",
+    "    experiments[p] = experiment    "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "import pandas as pd"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "df = pd.DataFrame(experiments)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {
+    "collapsed": false,
+    "scrolled": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>10</th>\n",
+       "      <th>20</th>\n",
+       "      <th>30</th>\n",
+       "      <th>40</th>\n",
+       "      <th>50</th>\n",
+       "      <th>60</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0.1</th>\n",
+       "      <td>255</td>\n",
+       "      <td>629</td>\n",
+       "      <td>1216</td>\n",
+       "      <td>2169</td>\n",
+       "      <td>3901</td>\n",
+       "      <td>7737</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.2</th>\n",
+       "      <td>179</td>\n",
+       "      <td>479</td>\n",
+       "      <td>908</td>\n",
+       "      <td>1624</td>\n",
+       "      <td>2883</td>\n",
+       "      <td>5431</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.3</th>\n",
+       "      <td>131</td>\n",
+       "      <td>388</td>\n",
+       "      <td>741</td>\n",
+       "      <td>1345</td>\n",
+       "      <td>2319</td>\n",
+       "      <td>4292</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.4</th>\n",
+       "      <td>89</td>\n",
+       "      <td>300</td>\n",
+       "      <td>613</td>\n",
+       "      <td>1101</td>\n",
+       "      <td>1907</td>\n",
+       "      <td>3445</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.5</th>\n",
+       "      <td>41</td>\n",
+       "      <td>216</td>\n",
+       "      <td>492</td>\n",
+       "      <td>881</td>\n",
+       "      <td>1552</td>\n",
+       "      <td>2704</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.6</th>\n",
+       "      <td>6</td>\n",
+       "      <td>108</td>\n",
+       "      <td>339</td>\n",
+       "      <td>659</td>\n",
+       "      <td>1213</td>\n",
+       "      <td>2083</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.7</th>\n",
+       "      <td>1</td>\n",
+       "      <td>15</td>\n",
+       "      <td>123</td>\n",
+       "      <td>402</td>\n",
+       "      <td>830</td>\n",
+       "      <td>1494</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.8</th>\n",
+       "      <td>0</td>\n",
+       "      <td>1</td>\n",
+       "      <td>12</td>\n",
+       "      <td>74</td>\n",
+       "      <td>313</td>\n",
+       "      <td>837</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.9</th>\n",
+       "      <td>0</td>\n",
+       "      <td>0</td>\n",
+       "      <td>1</td>\n",
+       "      <td>3</td>\n",
+       "      <td>17</td>\n",
+       "      <td>101</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "      10   20    30    40    50    60\n",
+       "0.1  255  629  1216  2169  3901  7737\n",
+       "0.2  179  479   908  1624  2883  5431\n",
+       "0.3  131  388   741  1345  2319  4292\n",
+       "0.4   89  300   613  1101  1907  3445\n",
+       "0.5   41  216   492   881  1552  2704\n",
+       "0.6    6  108   339   659  1213  2083\n",
+       "0.7    1   15   123   402   830  1494\n",
+       "0.8    0    1    12    74   313   837\n",
+       "0.9    0    0     1     3    17   101"
+      ]
+     },
+     "execution_count": 16,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "df"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "def exclude_words_bellow_threshold(vec, t: float):\n",
+    "    tfidfs = cast_sparse_vector_to_dict_and_scale(vec)\n",
+    "    return [i_tfidf[0] for i_tfidf in tfidfs.items() if i_tfidf[1] < t]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "p: 0.5, t: 0.9, count: 71864\n",
+      "p: 0.5, t: 0.8, count: 82381\n",
+      "p: 0.5, t: 0.7, count: 89513\n",
+      "p: 0.5, t: 0.6, count: 93136\n",
+      "p: 0.5, t: 0.5, count: 94038\n",
+      "p: 0.5, t: 0.4, count: 96707\n",
+      "p: 0.5, t: 0.3, count: 97427\n",
+      "p: 0.5, t: 0.2, count: 97559\n",
+      "p: 0.5, t: 0.1, count: 97623\n",
+      "p: 0.4, t: 0.9, count: 60149\n",
+      "p: 0.4, t: 0.8, count: 74208\n",
+      "p: 0.4, t: 0.7, count: 84474\n",
+      "p: 0.4, t: 0.6, count: 89860\n",
+      "p: 0.4, t: 0.5, count: 91441\n",
+      "p: 0.4, t: 0.4, count: 95392\n",
+      "p: 0.4, t: 0.3, count: 96629\n",
+      "p: 0.4, t: 0.2, count: 96898\n",
+      "p: 0.4, t: 0.1, count: 97030\n",
+      "p: 0.3, t: 0.9, count: 42576\n",
+      "p: 0.3, t: 0.8, count: 59652\n",
+      "p: 0.3, t: 0.7, count: 74157\n",
+      "p: 0.3, t: 0.6, count: 82756\n",
+      "p: 0.3, t: 0.5, count: 85979\n",
+      "p: 0.3, t: 0.4, count: 92390\n",
+      "p: 0.3, t: 0.3, count: 94894\n",
+      "p: 0.3, t: 0.2, count: 95560\n",
+      "p: 0.3, t: 0.1, count: 95868\n",
+      "p: 0.2, t: 0.9, count: 19740\n",
+      "p: 0.2, t: 0.8, count: 33481\n",
+      "p: 0.2, t: 0.7, count: 51274\n",
+      "p: 0.2, t: 0.6, count: 65199\n",
+      "p: 0.2, t: 0.5, count: 72501\n",
+      "p: 0.2, t: 0.4, count: 83742\n",
+      "p: 0.2, t: 0.3, count: 89707\n",
+      "p: 0.2, t: 0.2, count: 91873\n",
+      "p: 0.2, t: 0.1, count: 93014\n",
+      "p: 0.1, t: 0.9, count: 4005\n",
+      "p: 0.1, t: 0.8, count: 5467\n",
+      "p: 0.1, t: 0.7, count: 10564\n",
+      "p: 0.1, t: 0.6, count: 19556\n",
+      "p: 0.1, t: 0.5, count: 29451\n",
+      "p: 0.1, t: 0.4, count: 48101\n",
+      "p: 0.1, t: 0.3, count: 64431\n",
+      "p: 0.1, t: 0.2, count: 74179\n",
+      "p: 0.1, t: 0.1, count: 81103\n",
+      "p: 0.05, t: 0.9, count: 865\n",
+      "p: 0.05, t: 0.8, count: 892\n",
+      "p: 0.05, t: 0.7, count: 1218\n",
+      "p: 0.05, t: 0.6, count: 2206\n",
+      "p: 0.05, t: 0.5, count: 3430\n",
+      "p: 0.05, t: 0.4, count: 9273\n",
+      "p: 0.05, t: 0.3, count: 19923\n",
+      "p: 0.05, t: 0.2, count: 34945\n",
+      "p: 0.05, t: 0.1, count: 54816\n",
+      "p: 0.01, t: 0.9, count: 25\n",
+      "p: 0.01, t: 0.8, count: 25\n",
+      "p: 0.01, t: 0.7, count: 25\n",
+      "p: 0.01, t: 0.6, count: 27\n",
+      "p: 0.01, t: 0.5, count: 27\n",
+      "p: 0.01, t: 0.4, count: 102\n",
+      "p: 0.01, t: 0.3, count: 229\n",
+      "p: 0.01, t: 0.2, count: 437\n",
+      "p: 0.01, t: 0.1, count: 1326\n",
+      "p: 0.005, t: 0.9, count: 7\n",
+      "p: 0.005, t: 0.8, count: 7\n",
+      "p: 0.005, t: 0.7, count: 7\n",
+      "p: 0.005, t: 0.6, count: 7\n",
+      "p: 0.005, t: 0.5, count: 7\n",
+      "p: 0.005, t: 0.4, count: 30\n",
+      "p: 0.005, t: 0.3, count: 68\n",
+      "p: 0.005, t: 0.2, count: 132\n",
+      "p: 0.005, t: 0.1, count: 337\n"
+     ]
+    }
+   ],
+   "source": [
+    "experiments_2 = {}\n",
+    "for p in [.5, .4, .3, .2, .1, .05, .01, .005]:\n",
+    "    excluded = tfidf.flatMap(lambda vec: exclude_words_bellow_threshold(vec, p)). \\\n",
+    "        map(lambda i: (i, 1)). \\\n",
+    "        reduceByKey(lambda a,b: a+b).persist()\n",
+    "    stat = wc.join(excluded).map(lambda s: (s[0], s[1][1]/s[1][0])).persist()\n",
+    "    experiment = {}\n",
+    "    for t in [.9, .8, .7, .6, .5, .4, .3, .2, .1]:\n",
+    "        excluded_count = stat.filter(lambda s: s[1] > t).count()\n",
+    "        experiment[t] = excluded_count\n",
+    "        print(\"p: {0}, t: {1}, count: {2}\".format(p, t, excluded_count))\n",
+    "    stat.unpersist()\n",
+    "    excluded.unpersist()\n",
+    "    experiments_2[p] = experiment    "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {
+    "collapsed": false,
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>0.005</th>\n",
+       "      <th>0.01</th>\n",
+       "      <th>0.05</th>\n",
+       "      <th>0.1</th>\n",
+       "      <th>0.2</th>\n",
+       "      <th>0.3</th>\n",
+       "      <th>0.4</th>\n",
+       "      <th>0.5</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0.1</th>\n",
+       "      <td>337</td>\n",
+       "      <td>1326</td>\n",
+       "      <td>54816</td>\n",
+       "      <td>81103</td>\n",
+       "      <td>93014</td>\n",
+       "      <td>95868</td>\n",
+       "      <td>97030</td>\n",
+       "      <td>97623</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.2</th>\n",
+       "      <td>132</td>\n",
+       "      <td>437</td>\n",
+       "      <td>34945</td>\n",
+       "      <td>74179</td>\n",
+       "      <td>91873</td>\n",
+       "      <td>95560</td>\n",
+       "      <td>96898</td>\n",
+       "      <td>97559</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.3</th>\n",
+       "      <td>68</td>\n",
+       "      <td>229</td>\n",
+       "      <td>19923</td>\n",
+       "      <td>64431</td>\n",
+       "      <td>89707</td>\n",
+       "      <td>94894</td>\n",
+       "      <td>96629</td>\n",
+       "      <td>97427</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.4</th>\n",
+       "      <td>30</td>\n",
+       "      <td>102</td>\n",
+       "      <td>9273</td>\n",
+       "      <td>48101</td>\n",
+       "      <td>83742</td>\n",
+       "      <td>92390</td>\n",
+       "      <td>95392</td>\n",
+       "      <td>96707</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.5</th>\n",
+       "      <td>7</td>\n",
+       "      <td>27</td>\n",
+       "      <td>3430</td>\n",
+       "      <td>29451</td>\n",
+       "      <td>72501</td>\n",
+       "      <td>85979</td>\n",
+       "      <td>91441</td>\n",
+       "      <td>94038</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.6</th>\n",
+       "      <td>7</td>\n",
+       "      <td>27</td>\n",
+       "      <td>2206</td>\n",
+       "      <td>19556</td>\n",
+       "      <td>65199</td>\n",
+       "      <td>82756</td>\n",
+       "      <td>89860</td>\n",
+       "      <td>93136</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.7</th>\n",
+       "      <td>7</td>\n",
+       "      <td>25</td>\n",
+       "      <td>1218</td>\n",
+       "      <td>10564</td>\n",
+       "      <td>51274</td>\n",
+       "      <td>74157</td>\n",
+       "      <td>84474</td>\n",
+       "      <td>89513</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.8</th>\n",
+       "      <td>7</td>\n",
+       "      <td>25</td>\n",
+       "      <td>892</td>\n",
+       "      <td>5467</td>\n",
+       "      <td>33481</td>\n",
+       "      <td>59652</td>\n",
+       "      <td>74208</td>\n",
+       "      <td>82381</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>0.9</th>\n",
+       "      <td>7</td>\n",
+       "      <td>25</td>\n",
+       "      <td>865</td>\n",
+       "      <td>4005</td>\n",
+       "      <td>19740</td>\n",
+       "      <td>42576</td>\n",
+       "      <td>60149</td>\n",
+       "      <td>71864</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "     0.005  0.010  0.050  0.100  0.200  0.300  0.400  0.500\n",
+       "0.1    337   1326  54816  81103  93014  95868  97030  97623\n",
+       "0.2    132    437  34945  74179  91873  95560  96898  97559\n",
+       "0.3     68    229  19923  64431  89707  94894  96629  97427\n",
+       "0.4     30    102   9273  48101  83742  92390  95392  96707\n",
+       "0.5      7     27   3430  29451  72501  85979  91441  94038\n",
+       "0.6      7     27   2206  19556  65199  82756  89860  93136\n",
+       "0.7      7     25   1218  10564  51274  74157  84474  89513\n",
+       "0.8      7     25    892   5467  33481  59652  74208  82381\n",
+       "0.9      7     25    865   4005  19740  42576  60149  71864"
+      ]
+     },
+     "execution_count": 19,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "pd.DataFrame(experiments_2)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 12,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "98621"
+      ]
+     },
+     "execution_count": 12,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "idx_word = dict([(idx,w) for w,idx in storingTF.word_idx.items()])\n",
+    "len(idx_word)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 13,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "excluded = tfidf.flatMap(lambda vec: exclude_words_bellow_threshold(vec, 0.3)). \\\n",
+    "        map(lambda i: (i, 1)). \\\n",
+    "        reduceByKey(lambda a,b: a+b).persist()\n",
+    "stat = wc.join(excluded).map(lambda s: (s[0], s[1][1]/s[1][0])).persist()\n",
+    "excluded_words = stat.filter(lambda s: s[1] > 0.9).map(lambda x: idx_word[x[0]]).collect()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "42576"
+      ]
+     },
+     "execution_count": 14,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(excluded_words)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "['безделушк', 'тэгирован', 'байтаерт', 'efnet', 'sslversion']"
+      ]
+     },
+     "execution_count": 15,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "excluded_words[:5]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "set_of_excluded_words = set(excluded_words)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "42576"
+      ]
+     },
+     "execution_count": 17,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(set_of_excluded_words)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "def exclude_words(doc: dict):\n",
+    "    doc['Features'] = [w for w in doc['Features'] if w not in set_of_excluded_words]\n",
+    "    return doc"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "97.41282186022069"
+      ]
+     },
+     "execution_count": 19,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "data.map(exclude_words).map(lambda x: len(x['Features'])).mean()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "482.166663163426"
+      ]
+     },
+     "execution_count": 20,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "data.map(lambda x: len(x['Features'])).mean()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "doc_lengths = data.map(exclude_words).map(lambda x: len(x['Features'])).filter(lambda x: x<10).collect()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": [
+    "from matplotlib import pyplot as plt"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 23,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "plt.hist(doc_lengths, bins=40)\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 53,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "3229"
+      ]
+     },
+     "execution_count": 53,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "len(doc_lengths)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 22,
+   "metadata": {
+    "collapsed": false
+   },
+   "outputs": [],
+   "source": [
+    "data.map(exclude_words). \\\n",
+    "    filter(lambda x: len(x['Features']) > 20). \\\n",
+    "    map(lambda x: json.dumps(x)). \\\n",
+    "    repartition(4). \\\n",
+    "    saveAsTextFile('hdfs://master:54310/test3')"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {
+    "collapsed": true
+   },
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.4.3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}
+
